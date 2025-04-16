@@ -1,138 +1,199 @@
 package fuunel_loader
 
 import (
-	"errors"
-	"sync/atomic"
-	"time"
+	"context"
+	"fmt"
+	"sort"
+
+	"golang.org/x/sync/singleflight"
 )
 
-func WithCallback[T any](callback func(*T) error) option[T] {
-	return func(f *FuunelLoader[T]) {
-		f.callBack = callback
+func BuildCacheLoader[val any](cacheLoader func(ctx context.Context, keys []string) (map[string]val, error), cacheSetter func(ctx context.Context, result map[string]val) error) *cacheDefaultLoader[val] {
+	if cacheLoader == nil {
+		return nil
+	}
+	if cacheSetter == nil {
+		return nil
+	}
+	return &cacheDefaultLoader[val]{
+		cacheLoader: cacheLoader,
+		cacheSetter: cacheSetter,
 	}
 }
 
-func WithLoadErrHandler[T any](loadErrorHandler func(err error)) option[T] {
-	return func(f *FuunelLoader[T]) {
-		f.loadErrHandler = loadErrorHandler
-	}
+var _ DataSource[int] = &cacheDefaultLoader[int]{}
+
+type cacheDefaultLoader[VAL any] struct {
+	cacheLoader func(ctx context.Context, keys []string) (map[string]VAL, error)
+	cacheSetter func(ctx context.Context, result map[string]VAL) error
+	keyFormat   string
 }
 
-func WithCallbackErrHandler[T any](callbackErrorHandler func(err error)) option[T] {
-	return func(f *FuunelLoader[T]) {
-		f.callbackErrHandler = callbackErrorHandler
+func (s *cacheDefaultLoader[VAL]) MGet(ctx context.Context, keys []string) (result map[string]VAL, miss []string, err map[string]error) {
+	res, innerErr := s.cacheLoader(ctx, keys)
+	if innerErr != nil {
+		errMap := make(map[string]error, len(keys))
+		for _, key := range keys {
+			errMap[key] = innerErr
+		}
+		return nil, keys, errMap
 	}
+	result = make(map[string]VAL, len(keys))
+	miss = make([]string, 0, len(keys))
+	for _, key := range keys {
+		v, ok := res[key]
+		if !ok {
+			miss = append(miss, key)
+			continue
+		}
+		result[key] = v
+	}
+	return result, miss, nil
 }
 
-func WithStepMonitor[T any](stepMonitor func(preLoadStartAt, lastLoadStartAt, preLoadEndAt, lastLoadEndAt int64)) option[T] {
-	return func(f *FuunelLoader[T]) {
-		f.stepMonitor = stepMonitor
+func (s *cacheDefaultLoader[VAL]) MSet(ctx context.Context, result map[string]VAL) map[string]error {
+	if err := s.cacheSetter(ctx, result); err != nil {
+		errMap := make(map[string]error, len(result))
+		for key := range result {
+			errMap[key] = err
+		}
+		return errMap
 	}
+	return nil
 }
 
-type option[T any] func(*FuunelLoader[T])
+type levelLoaderErrorStatus string
 
-func New[T any](stepTime time.Duration, load func() (*T, error), options ...option[T]) *FuunelLoader[T] {
-	loader := &FuunelLoader[T]{
-		stepTime:    stepTime,
-		loader:      load,
-		result:      atomic.Pointer[T]{},
-		endStep:     true,
-		stepMonitor: nil,
-		closeChan:   make(chan struct{}),
-	}
-	for _, op := range options {
-		op(loader)
+const (
+	levelLoaderErrorStatusMGet levelLoaderErrorStatus = "mget"
+	levelLoaderErrorStatusMSet levelLoaderErrorStatus = "mset"
+)
+
+type DataSource[V any] interface {
+	MGet(ctx context.Context, keys []string) (result map[string]V, miss []string, err map[string]error)
+	MSet(ctx context.Context, result map[string]V) map[string]error
+}
+
+// BuildLevelDataLoader  创建数据源加载流程的模版,将接口按照加载顺序写入，比如localCache->remoteCache->db,就写入BuildLevelDataLoader(localCache,remoteCache,db)
+func BuildLevelDataLoader[V any](title string, sources ...DataSource[V]) *levelDataLoader[V] {
+	loader := &levelDataLoader[V]{
+		dataSourceList: sources,
+		title:          title,
+		sf:             singleflight.Group{},
 	}
 	return loader
 }
 
-type FuunelLoader[T any] struct {
-	stepTime                           time.Duration
-	callBack                           func(t *T) error
-	loader                             func() (*T, error)
-	result                             atomic.Pointer[T]
-	endStep                            bool
-	lastLoadStartAt, lastLoadEndAt     *time.Time
-	loadErrHandler, callbackErrHandler func(err error)
-	stepMonitor                        func(preLoadStartAt, lastLoadStartAt, preLoadEndAt, lastLoadEndAt int64)
-	closeChan                          chan struct{}
+type levelDataLoader[V any] struct {
+	dataSourceList []DataSource[V]
+	title          string
+
+	sf singleflight.Group
 }
 
-func (f *FuunelLoader[T]) Close() {
-	close(f.closeChan)
+func (l *levelDataLoader[V]) GetLoaderLen() int {
+	return len(l.dataSourceList)
 }
 
-func (f *FuunelLoader[T]) GetResult() *T {
-	return f.result.Load()
-}
+func (l *levelDataLoader[V]) buildLoader() func(ctx context.Context, keys []string, useSFInx int, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error) {
+	var invoke func(ctx context.Context, keys []string, useSFInx int, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (map[string]V, []string, map[string]map[int]error, map[string]map[int]error)
+	for inx := len(l.dataSourceList) - 1; inx >= 0; inx-- {
+		inx := inx
+		source := l.dataSourceList[inx]
+		curInvoke := invoke
 
-func (f *FuunelLoader[T]) Load() error {
-	if f.loader == nil {
-		return errors.New("fuun loader is nil")
-	}
-
-	go func() {
-		for {
-			select {
-			case <-f.closeChan:
+		invoke = func(ctx context.Context, keys []string, useSFInx int, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (map[string]V, []string, map[string]map[int]error, map[string]map[int]error) {
+			var (
+				getError map[string]error
+				setError map[string]error
+			)
+			loadFunc := func(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getErrors map[string]map[int]error, setErrors map[string]map[int]error) {
+				result = make(map[string]V, len(keys))
+				if _, ok := skipGetInx[inx]; !ok && len(keys) > 0 {
+					result, miss, getError = source.MGet(ctx, keys)
+					keys = miss
+				}
+				if curInvoke != nil && len(keys) > 0 {
+					nextResult, nextMiss, nextGetErr, nextSetErr := curInvoke(ctx, keys, useSFInx, skipGetInx, skipSetInx)
+					getErrors = nextGetErr
+					setErrors = nextSetErr
+					if _, ok := skipSetInx[inx]; len(nextResult) > 0 && !ok {
+						setError = source.MSet(ctx, nextResult)
+					}
+					for key, val := range nextResult {
+						result[key] = val
+					}
+					miss = nextMiss
+				}
+				getErrors = l.mergeErrors(getErrors, inx, getError)
+				setErrors = l.mergeErrors(setErrors, inx, setError)
 				return
-			case <-time.After(f.getNextTime()):
-				f.load()
 			}
+			if useSFInx != inx {
+				return loadFunc(ctx, keys, skipGetInx, skipSetInx)
+			}
+			return l.buildLoaderWithSF(loadFunc)(ctx, keys, skipGetInx, skipSetInx)
 		}
-	}()
-	return nil
+	}
+	return invoke
 }
 
-func (f *FuunelLoader[T]) getNextTime() time.Duration {
-	if f.lastLoadEndAt == nil {
-		return 0
+func (l *levelDataLoader[V]) buildLoaderWithSF(invoke func(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error)) func(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error) {
+	return func(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error) {
+		sort.Slice(keys, func(i, j int) bool {
+			return keys[i] < keys[j]
+		})
+		type res struct {
+			result   map[string]V
+			miss     []string
+			getError map[string]map[int]error
+			setError map[string]map[int]error
+		}
+		r, _, _ := l.sf.Do(l.title+fmt.Sprintf("%v", keys), func() (interface{}, error) {
+			hit, missKeys, getErr, setErr := invoke(ctx, keys, skipGetInx, skipSetInx)
+			return &res{
+				result:   hit,
+				miss:     missKeys,
+				getError: getErr,
+				setError: setErr,
+			}, nil
+		})
+		if r == nil {
+			return
+		}
+		rStruct := r.(*res)
+		return rStruct.result, rStruct.miss, rStruct.getError, rStruct.setError
 	}
-	if f.endStep {
-		return f.stepTime
-	}
-	step := f.lastLoadStartAt.Add(f.stepTime).Sub(time.Now())
-	for step < 0 {
-		step += f.stepTime
-	}
-	return step
 }
 
-func (f *FuunelLoader[T]) load() {
-	start := time.Now()
-	defer func() {
-		f.lastLoadStartAt = &start
-		if f.lastLoadEndAt.Before(start) {
-			f.lastLoadEndAt = &start
-		}
-	}()
-	res, err := f.loader()
-	if err != nil && f.loadErrHandler != nil {
-		f.loadErrHandler(err)
+func (l *levelDataLoader[V]) mergeErrors(resErr map[string]map[int]error, inx int, errs ...map[string]error) map[string]map[int]error {
+	if resErr == nil {
+		resErr = make(map[string]map[int]error)
 	}
+	for _, err := range errs {
+		for key, e := range err {
+			if resErr[key] == nil {
+				resErr[key] = make(map[int]error, 1)
+			}
+			resErr[key][inx] = e
+		}
+	}
+	return resErr
+}
 
-	if f.callBack != nil {
-		err = f.callBack(res)
-		if err != nil && f.callbackErrHandler != nil {
-			f.callbackErrHandler(err)
-		}
+func (l *levelDataLoader[V]) Load(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}, useSFInx *int) (result map[string]V, miss []string, getErrors, setErrors map[string]map[int]error) {
+	if l == nil || len(l.dataSourceList) == 0 {
+		return nil, keys, nil, nil
 	}
-	f.result.Store(res)
-	end := time.Now()
-	defer func() {
-		f.lastLoadStartAt = &end
-	}()
-	if f.stepMonitor != nil {
-		preStart := int64(0)
-		if f.lastLoadStartAt != nil {
-			preStart = f.lastLoadStartAt.Unix()
-		}
-		preEnd := int64(0)
-		if f.lastLoadEndAt != nil {
-			preEnd = f.lastLoadEndAt.Unix()
-		}
-		f.stepMonitor(preStart, start.Unix(), preEnd, end.Unix())
+	if skipGetInx == nil {
+		skipGetInx = make(map[int]struct{})
 	}
-	return
+	if skipSetInx == nil {
+		skipSetInx = make(map[int]struct{})
+	}
+	sfInx := -1
+	if useSFInx != nil {
+		sfInx = *useSFInx
+	}
+	return l.buildLoader()(ctx, keys, sfInx, skipGetInx, skipSetInx)
 }
