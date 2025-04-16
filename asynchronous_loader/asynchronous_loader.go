@@ -7,47 +7,57 @@ import (
 )
 
 func WithCallback[T any](callback func(*T) error) option[T] {
-	return func(f *FuunelLoader[T]) {
+	return func(f *AsynchronousLoader[T]) *AsynchronousLoader[T] {
 		f.callBack = callback
+		return f
 	}
 }
 
 func WithLoadErrHandler[T any](loadErrorHandler func(err error)) option[T] {
-	return func(f *FuunelLoader[T]) {
+	return func(f *AsynchronousLoader[T]) *AsynchronousLoader[T] {
 		f.loadErrHandler = loadErrorHandler
+		return f
 	}
 }
 
 func WithCallbackErrHandler[T any](callbackErrorHandler func(err error)) option[T] {
-	return func(f *FuunelLoader[T]) {
+	return func(f *AsynchronousLoader[T]) *AsynchronousLoader[T] {
 		f.callbackErrHandler = callbackErrorHandler
+		return f
 	}
 }
 
 func WithStepMonitor[T any](stepMonitor func(preLoadStartAt, lastLoadStartAt, preLoadEndAt, lastLoadEndAt int64)) option[T] {
-	return func(f *FuunelLoader[T]) {
+	return func(f *AsynchronousLoader[T]) *AsynchronousLoader[T] {
 		f.stepMonitor = stepMonitor
+		return f
 	}
 }
 
-type option[T any] func(*FuunelLoader[T])
+func WithEndStep[T any](endStep bool) option[T] {
+	return func(f *AsynchronousLoader[T]) *AsynchronousLoader[T] {
+		f.endStep = endStep
+		return f
+	}
+}
 
-func New[T any](stepTime time.Duration, load func() (*T, error), options ...option[T]) *FuunelLoader[T] {
-	loader := &FuunelLoader[T]{
-		stepTime:    stepTime,
-		loader:      load,
-		result:      atomic.Pointer[T]{},
-		endStep:     true,
-		stepMonitor: nil,
-		closeChan:   make(chan struct{}),
+type option[T any] func(*AsynchronousLoader[T]) *AsynchronousLoader[T]
+
+func New[T any](stepTime time.Duration, load func() (*T, error), options ...option[T]) *AsynchronousLoader[T] {
+	loader := &AsynchronousLoader[T]{
+		stepTime:  stepTime,
+		loader:    load,
+		result:    atomic.Pointer[T]{},
+		endStep:   true,
+		closeChan: make(chan struct{}),
 	}
 	for _, op := range options {
-		op(loader)
+		loader = op(loader)
 	}
 	return loader
 }
 
-type FuunelLoader[T any] struct {
+type AsynchronousLoader[T any] struct {
 	stepTime                           time.Duration
 	callBack                           func(t *T) error
 	loader                             func() (*T, error)
@@ -59,17 +69,32 @@ type FuunelLoader[T any] struct {
 	closeChan                          chan struct{}
 }
 
-func (f *FuunelLoader[T]) Close() {
+func (f *AsynchronousLoader[T]) Close() {
 	close(f.closeChan)
 }
 
-func (f *FuunelLoader[T]) GetResult() *T {
+func (f *AsynchronousLoader[T]) GetResult() *T {
 	return f.result.Load()
 }
 
-func (f *FuunelLoader[T]) Load() error {
+func (f *AsynchronousLoader[T]) check() error {
+	if f == nil {
+		return errors.New("cannot check asynchronous loader is nil")
+	}
 	if f.loader == nil {
 		return errors.New("fuun loader is nil")
+	}
+
+	if f.closeChan == nil {
+		f.closeChan = make(chan struct{})
+	}
+	return nil
+
+}
+
+func (f *AsynchronousLoader[T]) Do() error {
+	if err := f.check(); err != nil {
+		return err
 	}
 
 	go func() {
@@ -85,7 +110,7 @@ func (f *FuunelLoader[T]) Load() error {
 	return nil
 }
 
-func (f *FuunelLoader[T]) getNextTime() time.Duration {
+func (f *AsynchronousLoader[T]) getNextTime() time.Duration {
 	if f.lastLoadEndAt == nil {
 		return 0
 	}
@@ -99,7 +124,7 @@ func (f *FuunelLoader[T]) getNextTime() time.Duration {
 	return step
 }
 
-func (f *FuunelLoader[T]) load() {
+func (f *AsynchronousLoader[T]) load() {
 	start := time.Now()
 	defer func() {
 		f.lastLoadStartAt = &start
@@ -121,7 +146,7 @@ func (f *FuunelLoader[T]) load() {
 	f.result.Store(res)
 	end := time.Now()
 	defer func() {
-		f.lastLoadStartAt = &end
+		f.lastLoadEndAt = &end
 	}()
 	if f.stepMonitor != nil {
 		preStart := int64(0)

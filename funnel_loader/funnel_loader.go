@@ -1,4 +1,4 @@
-package fuunel_loader
+package funnel_loader
 
 import (
 	"context"
@@ -74,9 +74,9 @@ type DataSource[V any] interface {
 	MSet(ctx context.Context, result map[string]V) map[string]error
 }
 
-// BuildLevelDataLoader  创建数据源加载流程的模版,将接口按照加载顺序写入，比如localCache->remoteCache->db,就写入BuildLevelDataLoader(localCache,remoteCache,db)
-func BuildLevelDataLoader[V any](title string, sources ...DataSource[V]) *levelDataLoader[V] {
-	loader := &levelDataLoader[V]{
+// BuildFunnelDataLoader  创建数据源加载流程的模版,将接口按照加载顺序写入，比如localCache->remoteCache->db,就写入BuildLevelDataLoader(localCache,remoteCache,db)
+func BuildFunnelDataLoader[V any](title string, sources ...DataSource[V]) *funnelDataLoader[V] {
+	loader := &funnelDataLoader[V]{
 		dataSourceList: sources,
 		title:          title,
 		sf:             singleflight.Group{},
@@ -84,18 +84,18 @@ func BuildLevelDataLoader[V any](title string, sources ...DataSource[V]) *levelD
 	return loader
 }
 
-type levelDataLoader[V any] struct {
+type funnelDataLoader[V any] struct {
 	dataSourceList []DataSource[V]
 	title          string
 
 	sf singleflight.Group
 }
 
-func (l *levelDataLoader[V]) GetLoaderLen() int {
+func (l *funnelDataLoader[V]) GetLoaderLen() int {
 	return len(l.dataSourceList)
 }
 
-func (l *levelDataLoader[V]) buildLoader() func(ctx context.Context, keys []string, useSFInx int, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error) {
+func (l *funnelDataLoader[V]) buildLoader() func(ctx context.Context, keys []string, useSFInx int, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error) {
 	var invoke func(ctx context.Context, keys []string, useSFInx int, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (map[string]V, []string, map[string]map[int]error, map[string]map[int]error)
 	for inx := len(l.dataSourceList) - 1; inx >= 0; inx-- {
 		inx := inx
@@ -138,7 +138,7 @@ func (l *levelDataLoader[V]) buildLoader() func(ctx context.Context, keys []stri
 	return invoke
 }
 
-func (l *levelDataLoader[V]) buildLoaderWithSF(invoke func(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error)) func(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error) {
+func (l *funnelDataLoader[V]) buildLoaderWithSF(invoke func(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error)) func(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error) {
 	return func(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}) (result map[string]V, miss []string, getError map[string]map[int]error, setError map[string]map[int]error) {
 		sort.Slice(keys, func(i, j int) bool {
 			return keys[i] < keys[j]
@@ -166,7 +166,7 @@ func (l *levelDataLoader[V]) buildLoaderWithSF(invoke func(ctx context.Context, 
 	}
 }
 
-func (l *levelDataLoader[V]) mergeErrors(resErr map[string]map[int]error, inx int, errs ...map[string]error) map[string]map[int]error {
+func (l *funnelDataLoader[V]) mergeErrors(resErr map[string]map[int]error, inx int, errs ...map[string]error) map[string]map[int]error {
 	if resErr == nil {
 		resErr = make(map[string]map[int]error)
 	}
@@ -181,7 +181,7 @@ func (l *levelDataLoader[V]) mergeErrors(resErr map[string]map[int]error, inx in
 	return resErr
 }
 
-func (l *levelDataLoader[V]) Load(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}, useSFInx *int) (result map[string]V, miss []string, getErrors, setErrors map[string]map[int]error) {
+func (l *funnelDataLoader[V]) Load(ctx context.Context, keys []string, skipGetInx map[int]struct{}, skipSetInx map[int]struct{}, useSFInx *int) (result map[string]V, miss []string, getErrors, setErrors map[string]map[int]error) {
 	if l == nil || len(l.dataSourceList) == 0 {
 		return nil, keys, nil, nil
 	}

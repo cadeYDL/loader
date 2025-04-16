@@ -1,4 +1,4 @@
-package fuunel_loader
+package funnel_loader
 
 import (
 	"context"
@@ -99,7 +99,7 @@ func Test_levelDataLoader_LoadWithSF(t *testing.T) {
 		title:    "c",
 	}
 	ctx := context.Background()
-	loader := BuildLevelDataLoader[string]("ZYY_TEST", a, b, c)
+	loader := BuildFunnelDataLoader[string]("ZYY_TEST", a, b, c)
 	pWait := sync.WaitGroup{}
 	for i := 0; i < 10; i++ {
 		pWait.Add(1)
@@ -137,7 +137,7 @@ func Test_levelDataLoader_Load(t *testing.T) {
 		title:    "d",
 	}
 	ctx := context.Background()
-	loader := BuildLevelDataLoader[string]("ZYY_TEST", a, b, d, c)
+	loader := BuildFunnelDataLoader[string]("ZYY_TEST", a, b, d, c)
 
 	r1, m1, _, _ := loader.Load(ctx, []string{"a", "b", "c"}, nil, map[int]struct{}{0: {}, 1: {}, 2: {}, 3: {}}, nil)
 	assert.Equal(t, len(r1), 3)

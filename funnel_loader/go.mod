@@ -1,4 +1,4 @@
-module cadeYDL/loader/fuunel_loader
+module cadeYDL/loader/funnel_loader
 
 go 1.23.0
 
