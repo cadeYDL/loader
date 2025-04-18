@@ -60,9 +60,49 @@ func TestDo(t *testing.T) {
 }
 
 func TestCheck(t *testing.T) {
+	var al *AsynchronousLoader[[]int]
 
+	err := al.check()
+	assert.Equal(t, err != nil, true)
+
+	al = &AsynchronousLoader[[]int]{}
+	err = al.check()
+	assert.Equal(t, err != nil, true)
+	val := []int{1, 2, 3}
+	al = &AsynchronousLoader[[]int]{
+		loader: func() (*[]int, error) {
+			return &val, nil
+		},
+	}
+	err = al.check()
+	assert.Equal(t, err != nil, false)
 }
 
 func TestClose(t *testing.T) {
+	val := make([]int, 0, 1)
+	al := New[[]int](1*time.Second, func() (*[]int, error) {
+		val = append(val, 1)
+		return &val, nil
+	}, WithEndStep[[]int](false))
+	al.Do()
+	time.Sleep(10 * time.Second)
+	al.Close()
+	time.Sleep(10 * time.Second)
+	assert.Less(t, len(val), 11)
+}
+
+func TestCallback(t *testing.T) {
+
+}
+
+func TestErrHandler(t *testing.T) {
+
+}
+
+func TestCallbackHandler(t *testing.T) {
+
+}
+
+func TestStepMonitor(t *testing.T) {
 
 }
